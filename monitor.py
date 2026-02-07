@@ -1,0 +1,415 @@
+"""
+Reddit Monitor for r/RobloxTrading
+
+Continuously watches for new posts with images, scans them for
+Roblox limited items, and sends Discord alerts for hits.
+
+Usage:
+    python monitor.py                               (run continuously)
+    python monitor.py --test                         (also sends skip notices to Discord)
+    python monitor.py --once                         (check once and exit, don't loop)
+    python monitor.py --scan-last 3 --test --once    (scan the last 3 posts and exit)
+"""
+
+import os
+import sys
+import time
+import praw
+import requests
+from main import (
+    fetch_item_database,
+    build_lookup_tables,
+    process_image,
+    screen_text_post,
+    send_discord_text_lead,
+    DISCORD_WEBHOOK_URL,
+)
+
+# ──────────────────────────────────────────────
+# REDDIT CONFIGURATION (env vars)
+# ──────────────────────────────────────────────
+REDDIT_CLIENT_ID = os.environ["REDDIT_CLIENT_ID"]
+REDDIT_CLIENT_SECRET = os.environ["REDDIT_CLIENT_SECRET"]
+REDDIT_USER_AGENT = os.environ.get("REDDIT_USER_AGENT", "VisionScanner/1.0 by smg110")
+
+SUBREDDIT_NAMES = ["RobloxTrading", "crosstradingroblox", "RobloxLimiteds"]
+POLL_INTERVAL = 45          # seconds between checks
+MAX_POSTS_PER_CHECK = 15    # how many "new" posts to look at per subreddit each cycle
+ROLIMONS_REFRESH_MINS = 30  # re-fetch Rolimons data every N minutes
+
+# Image file extensions and domains we care about
+IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".webp")
+IMAGE_DOMAINS = ("i.redd.it", "i.imgur.com", "preview.redd.it")
+
+# Flairs that strongly indicate trade/sell intent (exact match, lowercased)
+TRADE_FLAIRS = {
+    "trade ad", "trade ads",
+    "trading help",
+    "w/l", "wfl",
+}
+
+# If a title contains ANY of these, skip the post immediately — not what we want
+EXCLUDE_KEYWORDS = [
+    "scammer", "scam alert", "scam", "scammed",
+    "beware", "warning", "banned", "report",
+    "giveaway", "giving away", "free",
+    "meme", "funny", "lol", "lmao",
+    "rant", "vent",
+]
+
+# Keywords in titles that indicate someone is actively trading, selling,
+# or asking for advice on a trade involving limited items
+TRADE_KEYWORDS = [
+    # Win/Loss trade checks
+    "w/l", "w / l", "w or l", "wfl", "w/f/l", "w f l",
+    "win or lose", "win or loss", "win/loss", "win/lose",
+    # Asking for trade advice
+    "is this good", "is this a good", "is this fair",
+    "good trade", "fair trade",
+    "should i do this", "should i accept", "should i take",
+    "did i win", "did i lose",
+    "overpay", "underpay",
+    # Selling / buying intent
+    "selling", "buying", "for sale",
+    "looking to sell", "looking to trade", "looking to buy",
+    "where to sell", "where can i sell", "how to sell",
+    "taking offers", "open to offers",
+    "what can i get for",
+    # Value / price checks
+    "what is this worth", "what's this worth", "how much is",
+    "price check", "worth anything",
+    # Active trade context
+    "this trade", "got offered", "someone offered",
+    "should i trade", "want to trade",
+]
+
+# Keywords that suggest a text post might be from a potential seller / returning player
+# These posts go through Gemini screening for confirmation (no false positives)
+TEXT_LEAD_KEYWORDS = [
+    "haven't played", "havent played",
+    "haven't been on", "havent been on",
+    "old account", "my old", "years ago",
+    "came back", "got back", "just got back", "returning",
+    "is this rare", "are these rare", "is this worth",
+    "are my items worth", "what are my items",
+    "how do i sell", "where do i sell", "where can i sell",
+    "sell my items", "sell my account", "sell limiteds",
+    "worth any money", "worth anything",
+    "items worth", "account worth",
+    "sell limited", "sell expensive",
+    "how much are my", "how much is my",
+    "cash out", "cashout",
+    "quit roblox", "quitting roblox", "leaving roblox",
+]
+
+
+# ──────────────────────────────────────────────
+# HELPERS
+# ──────────────────────────────────────────────
+
+def is_trade_related(post) -> bool:
+    """Check if a post is someone actively trading, selling, or asking trade advice.
+
+    Excludes scammer reports, memes, giveaways, and other noise.
+    """
+    title_lower = post.title.strip().lower()
+    flair = (post.link_flair_text or "").strip().lower()
+
+    # Hard exclude: skip scam reports, memes, etc. regardless of other signals
+    for exclude in EXCLUDE_KEYWORDS:
+        if exclude in title_lower or exclude in flair:
+            return False
+
+    # Check flair (only specific trade-related flairs)
+    if flair in TRADE_FLAIRS:
+        return True
+
+    # Check title keywords
+    for keyword in TRADE_KEYWORDS:
+        if keyword in title_lower:
+            return True
+
+    return False
+
+def is_potential_text_lead(post) -> bool:
+    """Check if a text-only post might be from a potential seller or returning player.
+
+    This is a keyword pre-filter. Posts that pass this go to Gemini for strict screening.
+    """
+    title_lower = post.title.strip().lower()
+    body_lower = (post.selftext or "").strip().lower()
+    flair = (post.link_flair_text or "").strip().lower()
+
+    # Hard exclude first
+    for exclude in EXCLUDE_KEYWORDS:
+        if exclude in title_lower or exclude in flair:
+            return False
+
+    # Check title + body for text lead keywords
+    combined = title_lower + " " + body_lower
+    for keyword in TEXT_LEAD_KEYWORDS:
+        if keyword in combined:
+            return True
+
+    # Also check trade flairs for text posts (e.g. "Trading Help" flair with no image)
+    if flair in TRADE_FLAIRS:
+        return True
+
+    return False
+
+
+def get_image_urls_from_post(post) -> list[str]:
+    """Extract ALL image URLs from a Reddit post (handles galleries)."""
+    urls = []
+    url = post.url
+
+    # Reddit gallery (multiple images) — grab ALL of them
+    if hasattr(post, "is_gallery") and post.is_gallery:
+        try:
+            media = post.media_metadata
+            for item in media.values():
+                if item.get("status") == "valid" and "s" in item:
+                    img_url = item["s"].get("u", "")
+                    if img_url:
+                        urls.append(img_url.replace("&amp;", "&"))
+        except Exception:
+            pass
+        return urls
+
+    # Direct image link
+    if any(url.lower().endswith(ext) for ext in IMAGE_EXTENSIONS):
+        return [url]
+
+    # Known image hosting domains
+    if any(domain in url for domain in IMAGE_DOMAINS):
+        return [url]
+
+    return []
+
+
+def send_startup_notice(subreddit_names: list[str]) -> None:
+    """Send a Discord embed to confirm the monitor is running."""
+    subs = ", ".join(f"**r/{s}**" for s in subreddit_names)
+    embed = {
+        "title": "Monitor Started",
+        "color": 0x00CC00,
+        "description": (
+            f"Now watching {subs} for new posts.\n"
+            f"Polling every **{POLL_INTERVAL}s**."
+        ),
+    }
+    try:
+        requests.post(
+            DISCORD_WEBHOOK_URL,
+            json={"embeds": [embed]},
+            timeout=10,
+        )
+    except Exception:
+        pass
+
+
+# ──────────────────────────────────────────────
+# MAIN MONITOR LOOP
+# ──────────────────────────────────────────────
+
+def _process_post(post, name_lookup, acronym_lookup, seen_post_ids, testing, sub_name):
+    """Process a single Reddit post. Returns 'hit', 'skip', or 'lead'."""
+    seen_post_ids.add(post.id)
+    post_link = f"https://reddit.com{post.permalink}"
+    image_urls = get_image_urls_from_post(post)
+
+    # ── Image post with trade intent ──
+    if is_trade_related(post) and image_urls:
+        flair = (post.link_flair_text or "none").strip()
+        print(f"  Trade-related image post! [{flair}]")
+        print(f"  Found {len(image_urls)} image(s)")
+        for idx, img_url in enumerate(image_urls):
+            print(f"  Image {idx + 1}/{len(image_urls)}: {img_url}")
+            try:
+                found = process_image(
+                    img_url, name_lookup, acronym_lookup,
+                    testing=testing,
+                    post_title=post.title,
+                    post_url=post_link,
+                )
+                if found:
+                    return "hit"
+            except Exception as e:
+                print(f"  Error: {e}")
+        return "skip"
+
+    # ── Text-only post: potential seller / returning player ──
+    if is_potential_text_lead(post):
+        print(f"  Potential text lead. Screening...")
+        body = (post.selftext or "").strip()
+        is_lead, reason, matched_items = screen_text_post(
+            post.title, body, name_lookup, acronym_lookup,
+        )
+        if is_lead:
+            print(f"  LEAD confirmed: {reason}")
+            send_discord_text_lead(post.title, post_link, body, reason, matched_items)
+            return "lead"
+        else:
+            print(f"  Not a lead: {reason}")
+            return "skip"
+
+    return "skip"
+
+
+def run_monitor(testing: bool = False, once: bool = False, scan_last: int = 0):
+    # ── Connect to Reddit (read-only, no password needed) ──
+    print("Connecting to Reddit...")
+    reddit = praw.Reddit(
+        client_id=REDDIT_CLIENT_ID,
+        client_secret=REDDIT_CLIENT_SECRET,
+        user_agent=REDDIT_USER_AGENT,
+    )
+    subs_str = ", ".join(f"r/{s}" for s in SUBREDDIT_NAMES)
+    print(f"  Connected. Monitoring: {subs_str}")
+
+    # ── Load Rolimons database ──
+    items_db = fetch_item_database()
+    name_lookup, acronym_lookup = build_lookup_tables(items_db)
+    last_rolimons_refresh = time.time()
+
+    # ── Track seen posts ──
+    seen_post_ids = set()
+
+    # --scan-last N: process the last N posts from each subreddit
+    if scan_last > 0:
+        total_hits = 0
+        total_skips = 0
+        total_posts = 0
+
+        for sub_name in SUBREDDIT_NAMES:
+            subreddit = reddit.subreddit(sub_name)
+            print(f"\n{'='*50}")
+            print(f"  Scanning last {scan_last} post(s) from r/{sub_name}")
+            print(f"{'='*50}")
+
+            for post in subreddit.new(limit=scan_last):
+                if post.id in seen_post_ids:
+                    continue
+                total_posts += 1
+                flair = (post.link_flair_text or "none").strip()
+                print(f"\n  Post:  \"{post.title}\"")
+                print(f"  Flair: {flair}")
+                print(f"  Link:  https://reddit.com{post.permalink}")
+
+                # Quick filter
+                if not is_trade_related(post) and not is_potential_text_lead(post):
+                    print(f"  Not relevant. Skipping.")
+                    seen_post_ids.add(post.id)
+                    total_skips += 1
+                    continue
+
+                result = _process_post(post, name_lookup, acronym_lookup, seen_post_ids, testing, sub_name)
+                if result in ("hit", "lead"):
+                    total_hits += 1
+                else:
+                    total_skips += 1
+
+        print(f"\n{'='*50}")
+        print(f"Scan complete. {total_hits} hit(s), {total_skips} skip(s) out of {total_posts} post(s).")
+        print(f"{'='*50}")
+        if once:
+            return
+    else:
+        # Normal startup: seed with existing posts so we don't re-process
+        print("Seeding with existing posts...")
+        for sub_name in SUBREDDIT_NAMES:
+            subreddit = reddit.subreddit(sub_name)
+            count = 0
+            for post in subreddit.new(limit=MAX_POSTS_PER_CHECK):
+                seen_post_ids.add(post.id)
+                count += 1
+            print(f"  r/{sub_name}: seeded {count} post(s)")
+        print(f"  Total: {len(seen_post_ids)} post(s). Will only process NEW posts from now on.")
+
+    send_startup_notice(SUBREDDIT_NAMES)
+
+    print(f"\nMonitor is live. Polling every {POLL_INTERVAL}s. Press Ctrl+C to stop.\n")
+
+    # ── Poll loop ──
+    while True:
+        try:
+            # Refresh Rolimons data periodically
+            if time.time() - last_rolimons_refresh > ROLIMONS_REFRESH_MINS * 60:
+                print("Refreshing Rolimons data...")
+                try:
+                    items_db = fetch_item_database()
+                    name_lookup, acronym_lookup = build_lookup_tables(items_db)
+                    last_rolimons_refresh = time.time()
+                except Exception as e:
+                    print(f"  Warning: Rolimons refresh failed ({e}), using cached data.")
+
+            # Fetch latest posts from all subreddits
+            new_count = 0
+            hit_count = 0
+
+            for sub_name in SUBREDDIT_NAMES:
+                subreddit = reddit.subreddit(sub_name)
+
+                for post in subreddit.new(limit=MAX_POSTS_PER_CHECK):
+                    if post.id in seen_post_ids:
+                        continue
+
+                    new_count += 1
+
+                    # Quick filter
+                    if not is_trade_related(post) and not is_potential_text_lead(post):
+                        seen_post_ids.add(post.id)
+                        continue
+
+                    flair = (post.link_flair_text or "none").strip()
+                    print(f"\n[r/{sub_name}] \"{post.title}\" [{flair}]")
+                    print(f"  Link: https://reddit.com{post.permalink}")
+
+                    result = _process_post(post, name_lookup, acronym_lookup, seen_post_ids, testing, sub_name)
+                    if result in ("hit", "lead"):
+                        hit_count += 1
+
+            if new_count > 0:
+                print(f"\n[{time.strftime('%H:%M:%S')}] Checked {new_count} new post(s) across {len(SUBREDDIT_NAMES)} subs, {hit_count} hit(s).")
+            else:
+                print(f"[{time.strftime('%H:%M:%S')}] No new posts.", end="\r")
+
+        except KeyboardInterrupt:
+            print("\n\nMonitor stopped by user.")
+            break
+        except Exception as e:
+            print(f"\nError during poll: {e}")
+            print("Retrying in 30s...")
+            time.sleep(30)
+            continue
+
+        if once:
+            print("\n--once flag set. Exiting after single check.")
+            break
+
+        # Wait before next poll
+        time.sleep(POLL_INTERVAL)
+
+
+# ──────────────────────────────────────────────
+# ENTRY POINT
+# ──────────────────────────────────────────────
+
+if __name__ == "__main__":
+    testing = "--test" in sys.argv
+    once = "--once" in sys.argv
+
+    # Parse --scan-last N
+    scan_last = 0
+    for i, arg in enumerate(sys.argv):
+        if arg == "--scan-last" and i + 1 < len(sys.argv):
+            try:
+                scan_last = int(sys.argv[i + 1])
+            except ValueError:
+                pass
+
+    print("=" * 50)
+    print("  Roblox Trading Reddit Monitor")
+    print("=" * 50)
+
+    run_monitor(testing=testing, once=once, scan_last=scan_last)
