@@ -200,9 +200,12 @@ def match_single_item(
 ) -> tuple | None:
     """Try to match a single detected name against the database.
 
-    EXACT matching only — no guessing, no fuzzy logic.
+    Matching order:
       1. Exact normalised name match
       2. Exact acronym match
+      3. Prefix match — if Gemini returned a truncated name (e.g. "Dominus Formidulos..."
+         from a cut-off label), match it against the start of Rolimons names.
+         Only matches if the prefix is 3+ words to avoid false positives.
 
     Returns (item_id, item_data) or None.
     """
@@ -216,6 +219,18 @@ def match_single_item(
     # 2. Exact acronym
     if det_lower in acronym_lookup:
         return acronym_lookup[det_lower]
+
+    # 3. Prefix match (handles truncated names like "Dominus Formidulos...")
+    #    Require at least 2 words so single common words don't false-match
+    if len(det_norm.split()) >= 2 and len(det_norm) >= 8:
+        best_match = None
+        best_len = 0
+        for db_norm, (item_id, item_data) in name_lookup.items():
+            if db_norm.startswith(det_norm) and len(db_norm) > best_len:
+                best_match = (item_id, item_data)
+                best_len = len(db_norm)
+        if best_match:
+            return best_match
 
     return None
 
