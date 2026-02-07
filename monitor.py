@@ -111,9 +111,12 @@ def is_trade_related(post) -> bool:
     """Check if a post is someone actively trading, selling, or asking trade advice.
 
     Excludes scammer reports, memes, giveaways, and other noise.
+    Checks both title and post body for trade keywords (e.g. "is this good" in body).
     """
     title_lower = post.title.strip().lower()
+    body_lower = (post.selftext or "").strip().lower()
     flair = (post.link_flair_text or "").strip().lower()
+    title_and_body = title_lower + " " + body_lower
 
     # Hard exclude: skip scam reports, memes, etc. regardless of other signals
     for exclude in EXCLUDE_KEYWORDS:
@@ -124,9 +127,9 @@ def is_trade_related(post) -> bool:
     if flair in TRADE_FLAIRS:
         return True
 
-    # Check title keywords
+    # Check title and body for trade keywords (e.g. "help" + "guys is this good")
     for keyword in TRADE_KEYWORDS:
-        if keyword in title_lower:
+        if keyword in title_and_body:
             return True
 
     return False
