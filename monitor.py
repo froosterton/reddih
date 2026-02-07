@@ -26,10 +26,10 @@ from main import (
 )
 
 # ──────────────────────────────────────────────
-# REDDIT CONFIGURATION (env vars)
+# REDDIT CONFIGURATION (env vars; fallback for local run)
 # ──────────────────────────────────────────────
-REDDIT_CLIENT_ID = os.environ["REDDIT_CLIENT_ID"]
-REDDIT_CLIENT_SECRET = os.environ["REDDIT_CLIENT_SECRET"]
+REDDIT_CLIENT_ID = os.environ.get("REDDIT_CLIENT_ID", "bcHPImj3ngGQlY6A2OULag")
+REDDIT_CLIENT_SECRET = os.environ.get("REDDIT_CLIENT_SECRET", "YyEJHOM7C5RircOXPFM8kZfa3WCoYQ")
 REDDIT_USER_AGENT = os.environ.get("REDDIT_USER_AGENT", "VisionScanner/1.0 by smg110")
 
 SUBREDDIT_NAMES = ["RobloxTrading", "crosstradingroblox", "RobloxLimiteds"]
@@ -213,7 +213,7 @@ def send_startup_notice(subreddit_names: list[str]) -> None:
 # ──────────────────────────────────────────────
 
 def _process_post(post, name_lookup, acronym_lookup, seen_post_ids, testing, sub_name):
-    """Process a single Reddit post. Returns 'hit', 'skip', or 'lead'."""
+    """Process a single Reddit post. Returns (result, reason) where result is 'hit', 'skip', or 'lead'."""
     seen_post_ids.add(post.id)
     post_link = f"https://reddit.com{post.permalink}"
     image_urls = get_image_urls_from_post(post)
@@ -233,10 +233,10 @@ def _process_post(post, name_lookup, acronym_lookup, seen_post_ids, testing, sub
                     post_url=post_link,
                 )
                 if found:
-                    return "hit"
+                    return ("hit", "")
             except Exception as e:
                 print(f"  Error: {e}")
-        return "skip"
+        return ("skip", "scanned image(s) but no Rolimons item at or above 100k value")
 
     # ── Text-only post: potential seller / returning player ──
     if is_potential_text_lead(post):
@@ -248,12 +248,12 @@ def _process_post(post, name_lookup, acronym_lookup, seen_post_ids, testing, sub
         if is_lead:
             print(f"  LEAD confirmed: {reason}")
             send_discord_text_lead(post.title, post_link, body, reason, matched_items)
-            return "lead"
+            return ("lead", "")
         else:
             print(f"  Not a lead: {reason}")
-            return "skip"
+            return ("skip", reason)
 
-    return "skip"
+    return ("skip", "")
 
 
 def run_monitor(testing: bool = False, once: bool = False, scan_last: int = 0):
@@ -303,11 +303,13 @@ def run_monitor(testing: bool = False, once: bool = False, scan_last: int = 0):
                     total_skips += 1
                     continue
 
-                result = _process_post(post, name_lookup, acronym_lookup, seen_post_ids, testing, sub_name)
+                result, reason = _process_post(post, name_lookup, acronym_lookup, seen_post_ids, testing, sub_name)
                 if result in ("hit", "lead"):
                     total_hits += 1
                 else:
                     total_skips += 1
+                    if reason:
+                        print(f"  No alert: {reason}")
 
         print(f"\n{'='*50}")
         print(f"Scan complete. {total_hits} hit(s), {total_skips} skip(s) out of {total_posts} post(s).")
@@ -355,19 +357,25 @@ def run_monitor(testing: bool = False, once: bool = False, scan_last: int = 0):
                         continue
 
                     new_count += 1
+                    post_link = f"https://reddit.com{post.permalink}"
+                    flair = (post.link_flair_text or "none").strip()
 
-                    # Quick filter
+                    # Quick filter — log every post we consider, and why we skip
                     if not is_trade_related(post) and not is_potential_text_lead(post):
                         seen_post_ids.add(post.id)
+                        print(f"\n[{time.strftime('%H:%M:%S')}] r/{sub_name} — \"{post.title}\"")
+                        print(f"  Link: {post_link}")
+                        print(f"  Skipped: doesn't match trade-related or text-lead keywords/flair.")
                         continue
 
-                    flair = (post.link_flair_text or "none").strip()
                     print(f"\n[r/{sub_name}] \"{post.title}\" [{flair}]")
-                    print(f"  Link: https://reddit.com{post.permalink}")
+                    print(f"  Link: {post_link}")
 
-                    result = _process_post(post, name_lookup, acronym_lookup, seen_post_ids, testing, sub_name)
+                    result, reason = _process_post(post, name_lookup, acronym_lookup, seen_post_ids, testing, sub_name)
                     if result in ("hit", "lead"):
                         hit_count += 1
+                    elif reason:
+                        print(f"  No alert: {reason}")
 
             if new_count > 0:
                 print(f"\n[{time.strftime('%H:%M:%S')}] Checked {new_count} new post(s) across {len(SUBREDDIT_NAMES)} subs, {hit_count} hit(s).")
