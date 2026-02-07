@@ -162,11 +162,19 @@ def is_potential_text_lead(post) -> bool:
 
 
 def get_image_urls_from_post(post) -> list[str]:
-    """Extract ALL image URLs from a Reddit post (handles galleries)."""
+    """Extract ALL image URLs from a Reddit post.
+
+    Checks every possible source in order:
+      1. Gallery (multiple images via media_metadata)
+      2. Direct image link (post.url ends with image extension or is on known domain)
+      3. Preview images (post.preview.images[].source.url)
+      4. Non-gallery media_metadata (single embedded image)
+      5. Body text scan (regex for i.redd.it / imgur / preview.redd.it links)
+    """
     urls = []
     url = post.url
 
-    # Reddit gallery (multiple images) — grab ALL of them
+    # 1. Reddit gallery (multiple images)
     if hasattr(post, "is_gallery") and post.is_gallery:
         try:
             media = post.media_metadata
@@ -177,15 +185,60 @@ def get_image_urls_from_post(post) -> list[str]:
                         urls.append(img_url.replace("&amp;", "&"))
         except Exception:
             pass
-        return urls
+        if urls:
+            return urls
 
-    # Direct image link
+    # 2. Direct image link (post.url is the image itself)
     if any(url.lower().endswith(ext) for ext in IMAGE_EXTENSIONS):
         return [url]
-
-    # Known image hosting domains
     if any(domain in url for domain in IMAGE_DOMAINS):
         return [url]
+
+    # 3. Preview images (Reddit generates these for image posts and link posts)
+    try:
+        preview = getattr(post, "preview", None)
+        if preview:
+            images = preview.get("images", [])
+            for img in images:
+                source = img.get("source")
+                if source and source.get("url"):
+                    img_url = source["url"].replace("&amp;", "&")
+                    urls.append(img_url)
+            if urls:
+                return urls
+    except Exception:
+        pass
+
+    # 4. Non-gallery media_metadata (single embedded image)
+    try:
+        media = getattr(post, "media_metadata", None)
+        if media:
+            for item in media.values():
+                if isinstance(item, dict) and item.get("status") == "valid":
+                    img_url = ""
+                    if "s" in item:
+                        img_url = item["s"].get("u", "") or item["s"].get("url", "")
+                    if img_url:
+                        urls.append(img_url.replace("&amp;", "&"))
+            if urls:
+                return urls
+    except Exception:
+        pass
+
+    # 5. Scan selftext body for image URLs (i.redd.it, imgur, preview.redd.it)
+    body = getattr(post, "selftext", "") or ""
+    if body:
+        import re
+        img_pattern = re.findall(
+            r'https?://(?:i\.redd\.it|i\.imgur\.com|preview\.redd\.it)/[^\s\)\]>"]+',
+            body,
+        )
+        for found_url in img_pattern:
+            clean = found_url.replace("&amp;", "&")
+            if clean not in urls:
+                urls.append(clean)
+        if urls:
+            return urls
 
     return []
 
