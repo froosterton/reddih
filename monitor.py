@@ -107,31 +107,14 @@ TEXT_LEAD_KEYWORDS = [
 # HELPERS
 # ──────────────────────────────────────────────
 
-def is_trade_related(post) -> bool:
-    """Check if a post is someone actively trading, selling, or asking trade advice.
-
-    Excludes scammer reports, memes, giveaways, and other noise.
-    Checks both title and post body for trade keywords (e.g. "is this good" in body).
-    """
+def is_excluded(post) -> bool:
+    """Check if a post is obvious noise (scam report, meme, giveaway, etc.)."""
     title_lower = post.title.strip().lower()
-    body_lower = (post.selftext or "").strip().lower()
     flair = (post.link_flair_text or "").strip().lower()
-    title_and_body = title_lower + " " + body_lower
 
-    # Hard exclude: skip scam reports, memes, etc. regardless of other signals
     for exclude in EXCLUDE_KEYWORDS:
         if exclude in title_lower or exclude in flair:
-            return False
-
-    # Check flair (only specific trade-related flairs)
-    if flair in TRADE_FLAIRS:
-        return True
-
-    # Check title and body for trade keywords (e.g. "help" + "guys is this good")
-    for keyword in TRADE_KEYWORDS:
-        if keyword in title_and_body:
             return True
-
     return False
 
 def is_potential_text_lead(post) -> bool:
@@ -274,11 +257,9 @@ def _process_post(post, name_lookup, acronym_lookup, seen_post_ids, testing, sub
     post_link = f"https://reddit.com{post.permalink}"
     image_urls = get_image_urls_from_post(post)
 
-    # ── Image post with trade intent ──
-    if is_trade_related(post) and image_urls:
-        flair = (post.link_flair_text or "none").strip()
-        print(f"  Trade-related image post! [{flair}]")
-        print(f"  Found {len(image_urls)} image(s)")
+    # ── Any post with images (Gemini pre-screen is the real filter) ──
+    if image_urls:
+        print(f"  Image post — {len(image_urls)} image(s). Sending to Gemini...")
         for idx, img_url in enumerate(image_urls):
             print(f"  Image {idx + 1}/{len(image_urls)}: {img_url}")
             try:
@@ -416,12 +397,14 @@ def run_monitor(testing: bool = False, once: bool = False, scan_last: int = 0):
                     post_link = f"https://reddit.com{post.permalink}"
                     flair = (post.link_flair_text or "none").strip()
 
-                    # Quick filter — log every post we consider, and why we skip
-                    if not is_trade_related(post) and not is_potential_text_lead(post):
+                    # Quick filter — skip obvious noise; let everything else through
+                    image_urls = get_image_urls_from_post(post)
+                    if is_excluded(post):
                         seen_post_ids.add(post.id)
-                        print(f"\n[{time.strftime('%H:%M:%S')}] r/{sub_name} — \"{post.title}\"")
-                        print(f"  Link: {post_link}")
-                        print(f"  Skipped: doesn't match trade-related or text-lead keywords/flair.")
+                        continue
+                    # Text-only posts still need keyword match; image posts always go through
+                    if not image_urls and not is_potential_text_lead(post):
+                        seen_post_ids.add(post.id)
                         continue
 
                     print(f"\n[r/{sub_name}] \"{post.title}\" [{flair}]")
