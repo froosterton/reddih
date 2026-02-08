@@ -558,9 +558,10 @@ def screen_text_post(
         "Read this Reddit post and determine if the author is:\n"
         "1. A returning player who owns Roblox limited items and wants to know their value\n"
         "2. Asking how to sell their Roblox limited items or limited-holding account\n"
-        "3. Asking what their Roblox account with limiteds is worth\n\n"
+        "3. Asking what their Roblox account with limiteds is worth\n"
+        "4. Trading or offering specific Roblox limited items\n\n"
         "The person must clearly indicate they OWN limited items (or an old account "
-        "that likely has limiteds) and want to sell or value them.\n\n"
+        "that likely has limiteds) and want to sell, value, or trade them.\n\n"
         "Answer NO if:\n"
         "- They are selling Adopt Me, Blox Fruits, Murder Mystery, Royale High, "
         "or any other in-game items (NOT limiteds)\n"
@@ -570,9 +571,13 @@ def screen_text_post(
         "- It's unclear or vague what they are selling\n\n"
         "Be EXTREMELY strict. When in doubt, say NO.\n\n"
         f"--- POST ---\n{combined_text}\n--- END ---\n\n"
-        "Respond in EXACTLY this format (two lines only):\n"
+        "Respond in EXACTLY this format (three lines only):\n"
         "VERDICT: yes or no\n"
-        "REASON: one sentence explaining why"
+        "REASON: one sentence explaining why\n"
+        "ITEMS: comma-separated list of the specific Roblox limited item names "
+        "mentioned in the post (use the full official item name if you know it, "
+        "otherwise use exactly what the post says). Write 'none' if no specific "
+        "item names are mentioned."
     )
 
     try:
@@ -588,6 +593,7 @@ def screen_text_post(
     lines = text.strip().split("\n")
     verdict = False
     reason = ""
+    gemini_items_raw = ""
 
     for line in lines:
         line_lower = line.strip().lower()
@@ -595,7 +601,59 @@ def screen_text_post(
             verdict = "yes" in line_lower.split(":", 1)[1]
         elif line_lower.startswith("reason:"):
             reason = line.strip().split(":", 1)[1].strip()
+        elif line_lower.startswith("items:"):
+            gemini_items_raw = line.strip().split(":", 1)[1].strip()
 
+    if not verdict:
+        return False, reason, []
+
+    # ── Cross-reference Gemini-identified items against Rolimons ──
+    # If Gemini flagged the post AND identified specific items, check their values.
+    # Filter out the lead if all identified items are at or below the threshold.
+    gemini_item_names = []
+    if gemini_items_raw and gemini_items_raw.lower() != "none":
+        gemini_item_names = [n.strip() for n in gemini_items_raw.split(",") if n.strip()]
+
+    if gemini_item_names:
+        print(f"    Gemini identified item(s): {', '.join(gemini_item_names)}")
+        matched_above = []
+        matched_below = []
+
+        for item_name in gemini_item_names:
+            match = match_single_item(item_name, name_lookup, acronym_lookup)
+            if match:
+                item_id, item_data = match
+                value = item_data[3] if item_data[3] != -1 else item_data[2]
+                item_info = {
+                    "id": item_id,
+                    "name": item_data[0],
+                    "acronym": item_data[1],
+                    "value": value,
+                }
+                if value > MIN_VALUE_THRESHOLD:
+                    matched_above.append(item_info)
+                    print(f"      {item_data[0]} — R$ {value:,} (ABOVE threshold)")
+                else:
+                    matched_below.append(item_info)
+                    print(f"      {item_data[0]} — R$ {value:,} (at or below threshold)")
+            else:
+                print(f"      '{item_name}' — no Rolimons match found")
+
+        # If we matched at least one item but ALL are at or below threshold, skip
+        if (matched_above or matched_below) and not matched_above:
+            names = ", ".join(f"{m['name']} (R$ {m['value']:,})" for m in matched_below)
+            skip_reason = f"Item(s) identified by AI but at or below R$ {MIN_VALUE_THRESHOLD:,} threshold: {names}"
+            print(f"    Filtered out: {skip_reason}")
+            return False, skip_reason, []
+
+        # If we have items above threshold, return them as a confirmed lead
+        if matched_above:
+            matched_above.sort(key=lambda x: x["value"], reverse=True)
+            names = ", ".join(m["name"] for m in matched_above)
+            return True, f"{reason} (Confirmed item(s): {names})", matched_above
+
+    # No specific items identified or none matched Rolimons — trust Gemini's verdict
+    # (e.g. "returning player" posts where no item names are mentioned)
     return verdict, reason, []
 
 
