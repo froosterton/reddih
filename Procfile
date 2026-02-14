@@ -1,1 +1,1 @@
-worker: node monitor.js
+worker: python monitor.py
