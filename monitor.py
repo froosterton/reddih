@@ -26,29 +26,28 @@ from main import (
 )
 
 # ──────────────────────────────────────────────
-# REDDIT CONFIGURATION (env vars; fallback for local run)
+# REDDIT CONFIGURATION
 # ──────────────────────────────────────────────
-REDDIT_CLIENT_ID = os.environ.get("REDDIT_CLIENT_ID", "bcHPImj3ngGQlY6A2OULag")
-REDDIT_CLIENT_SECRET = os.environ.get("REDDIT_CLIENT_SECRET", "YyEJHOM7C5RircOXPFM8kZfa3WCoYQ")
+REDDIT_CLIENT_ID = os.environ["REDDIT_CLIENT_ID"]
+REDDIT_CLIENT_SECRET = os.environ["REDDIT_CLIENT_SECRET"]
+REDDIT_USERNAME = os.environ["REDDIT_USERNAME"]
+REDDIT_PASSWORD = os.environ["REDDIT_PASSWORD"]
 REDDIT_USER_AGENT = os.environ.get("REDDIT_USER_AGENT", "VisionScanner/1.0 by smg110")
 
 SUBREDDIT_NAMES = ["RobloxTrading", "crosstradingroblox", "RobloxLimiteds"]
-POLL_INTERVAL = 45          # seconds between checks
-MAX_POSTS_PER_CHECK = 15    # how many "new" posts to look at per subreddit each cycle
-ROLIMONS_REFRESH_MINS = 30  # re-fetch Rolimons data every N minutes
+POLL_INTERVAL = 45
+MAX_POSTS_PER_CHECK = 15
+ROLIMONS_REFRESH_MINS = 30
 
-# Image file extensions and domains we care about
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".webp")
 IMAGE_DOMAINS = ("i.redd.it", "i.imgur.com", "preview.redd.it")
 
-# Flairs that strongly indicate trade/sell intent (exact match, lowercased)
 TRADE_FLAIRS = {
     "trade ad", "trade ads",
     "trading help",
     "w/l", "wfl",
 }
 
-# If a title contains ANY of these, skip the post immediately — not what we want
 EXCLUDE_KEYWORDS = [
     "scammer", "scam alert", "scam", "scammed",
     "beware", "warning", "banned", "report",
@@ -57,8 +56,6 @@ EXCLUDE_KEYWORDS = [
     "rant", "vent",
 ]
 
-# Keywords that suggest a text post might be from a potential seller / returning player
-# These posts go through Gemini screening for confirmation (no false positives)
 TEXT_LEAD_KEYWORDS = [
     "haven't played", "havent played",
     "haven't been on", "havent been on",
@@ -82,7 +79,6 @@ TEXT_LEAD_KEYWORDS = [
 # ──────────────────────────────────────────────
 
 def is_excluded(post) -> bool:
-    """Check if a post is obvious noise (scam report, meme, giveaway, etc.)."""
     title_lower = post.title.strip().lower()
     flair = (post.link_flair_text or "").strip().lower()
 
@@ -92,26 +88,19 @@ def is_excluded(post) -> bool:
     return False
 
 def is_potential_text_lead(post) -> bool:
-    """Check if a text-only post might be from a potential seller or returning player.
-
-    This is a keyword pre-filter. Posts that pass this go to Gemini for strict screening.
-    """
     title_lower = post.title.strip().lower()
     body_lower = (post.selftext or "").strip().lower()
     flair = (post.link_flair_text or "").strip().lower()
 
-    # Hard exclude first
     for exclude in EXCLUDE_KEYWORDS:
         if exclude in title_lower or exclude in flair:
             return False
 
-    # Check title + body for text lead keywords
     combined = title_lower + " " + body_lower
     for keyword in TEXT_LEAD_KEYWORDS:
         if keyword in combined:
             return True
 
-    # Also check trade flairs for text posts (e.g. "Trading Help" flair with no image)
     if flair in TRADE_FLAIRS:
         return True
 
@@ -119,19 +108,9 @@ def is_potential_text_lead(post) -> bool:
 
 
 def get_image_urls_from_post(post) -> list[str]:
-    """Extract ALL image URLs from a Reddit post.
-
-    Checks every possible source in order:
-      1. Gallery (multiple images via media_metadata)
-      2. Direct image link (post.url ends with image extension or is on known domain)
-      3. Preview images (post.preview.images[].source.url)
-      4. Non-gallery media_metadata (single embedded image)
-      5. Body text scan (regex for i.redd.it / imgur / preview.redd.it links)
-    """
     urls = []
     url = post.url
 
-    # 1. Reddit gallery (multiple images)
     if hasattr(post, "is_gallery") and post.is_gallery:
         try:
             media = post.media_metadata
@@ -145,13 +124,11 @@ def get_image_urls_from_post(post) -> list[str]:
         if urls:
             return urls
 
-    # 2. Direct image link (post.url is the image itself)
     if any(url.lower().endswith(ext) for ext in IMAGE_EXTENSIONS):
         return [url]
     if any(domain in url for domain in IMAGE_DOMAINS):
         return [url]
 
-    # 3. Preview images (Reddit generates these for image posts and link posts)
     try:
         preview = getattr(post, "preview", None)
         if preview:
@@ -166,7 +143,6 @@ def get_image_urls_from_post(post) -> list[str]:
     except Exception:
         pass
 
-    # 4. Non-gallery media_metadata (single embedded image)
     try:
         media = getattr(post, "media_metadata", None)
         if media:
@@ -182,7 +158,6 @@ def get_image_urls_from_post(post) -> list[str]:
     except Exception:
         pass
 
-    # 5. Scan selftext body for image URLs (i.redd.it, imgur, preview.redd.it)
     body = getattr(post, "selftext", "") or ""
     if body:
         import re
@@ -201,7 +176,6 @@ def get_image_urls_from_post(post) -> list[str]:
 
 
 def send_startup_notice(subreddit_names: list[str]) -> None:
-    """Send a Discord embed to confirm the monitor is running."""
     subs = ", ".join(f"**r/{s}**" for s in subreddit_names)
     embed = {
         "title": "Monitor Started",
@@ -226,12 +200,10 @@ def send_startup_notice(subreddit_names: list[str]) -> None:
 # ──────────────────────────────────────────────
 
 def _process_post(post, name_lookup, acronym_lookup, seen_post_ids, testing, sub_name):
-    """Process a single Reddit post. Returns (result, reason) where result is 'hit', 'skip', or 'lead'."""
     seen_post_ids.add(post.id)
     post_link = f"https://reddit.com{post.permalink}"
     image_urls = get_image_urls_from_post(post)
 
-    # ── Any post with images (Gemini pre-screen is the real filter) ──
     if image_urls:
         print(f"  Image post — {len(image_urls)} image(s). Sending to Gemini...")
         for idx, img_url in enumerate(image_urls):
@@ -249,7 +221,6 @@ def _process_post(post, name_lookup, acronym_lookup, seen_post_ids, testing, sub
                 print(f"  Error: {e}")
         return ("skip", "scanned image(s) but no Rolimons item at or above 100k value")
 
-    # ── Text-only post: potential seller / returning player ──
     if is_potential_text_lead(post):
         print(f"  Potential text lead. Screening...")
         body = (post.selftext or "").strip()
@@ -268,25 +239,23 @@ def _process_post(post, name_lookup, acronym_lookup, seen_post_ids, testing, sub
 
 
 def run_monitor(testing: bool = False, once: bool = False, scan_last: int = 0):
-    # ── Connect to Reddit (read-only, no password needed) ──
     print("Connecting to Reddit...")
     reddit = praw.Reddit(
         client_id=REDDIT_CLIENT_ID,
         client_secret=REDDIT_CLIENT_SECRET,
+        username=REDDIT_USERNAME,
+        password=REDDIT_PASSWORD,
         user_agent=REDDIT_USER_AGENT,
     )
     subs_str = ", ".join(f"r/{s}" for s in SUBREDDIT_NAMES)
     print(f"  Connected. Monitoring: {subs_str}")
 
-    # ── Load Rolimons database ──
     items_db = fetch_item_database()
     name_lookup, acronym_lookup = build_lookup_tables(items_db)
     last_rolimons_refresh = time.time()
 
-    # ── Track seen posts ──
     seen_post_ids = set()
 
-    # --scan-last N: process the last N posts from each subreddit
     if scan_last > 0:
         total_hits = 0
         total_skips = 0
@@ -307,7 +276,6 @@ def run_monitor(testing: bool = False, once: bool = False, scan_last: int = 0):
                 print(f"  Flair: {flair}")
                 print(f"  Link:  https://reddit.com{post.permalink}")
 
-                # Quick filter — skip noise; image posts always go through
                 scan_images = get_image_urls_from_post(post)
                 if is_excluded(post):
                     print(f"  Excluded (noise). Skipping.")
@@ -334,7 +302,6 @@ def run_monitor(testing: bool = False, once: bool = False, scan_last: int = 0):
         if once:
             return
     else:
-        # Normal startup: seed with existing posts so we don't re-process
         print("Seeding with existing posts...")
         for sub_name in SUBREDDIT_NAMES:
             subreddit = reddit.subreddit(sub_name)
@@ -349,10 +316,8 @@ def run_monitor(testing: bool = False, once: bool = False, scan_last: int = 0):
 
     print(f"\nMonitor is live. Polling every {POLL_INTERVAL}s. Press Ctrl+C to stop.\n")
 
-    # ── Poll loop ──
     while True:
         try:
-            # Refresh Rolimons data periodically
             if time.time() - last_rolimons_refresh > ROLIMONS_REFRESH_MINS * 60:
                 print("Refreshing Rolimons data...")
                 try:
@@ -362,7 +327,6 @@ def run_monitor(testing: bool = False, once: bool = False, scan_last: int = 0):
                 except Exception as e:
                     print(f"  Warning: Rolimons refresh failed ({e}), using cached data.")
 
-            # Fetch latest posts from all subreddits
             new_count = 0
             hit_count = 0
 
@@ -377,12 +341,10 @@ def run_monitor(testing: bool = False, once: bool = False, scan_last: int = 0):
                     post_link = f"https://reddit.com{post.permalink}"
                     flair = (post.link_flair_text or "none").strip()
 
-                    # Quick filter — skip obvious noise; let everything else through
                     image_urls = get_image_urls_from_post(post)
                     if is_excluded(post):
                         seen_post_ids.add(post.id)
                         continue
-                    # Text-only posts still need keyword match; image posts always go through
                     if not image_urls and not is_potential_text_lead(post):
                         seen_post_ids.add(post.id)
                         continue
@@ -414,7 +376,6 @@ def run_monitor(testing: bool = False, once: bool = False, scan_last: int = 0):
             print("\n--once flag set. Exiting after single check.")
             break
 
-        # Wait before next poll
         time.sleep(POLL_INTERVAL)
 
 
@@ -426,7 +387,6 @@ if __name__ == "__main__":
     testing = "--test" in sys.argv
     once = "--once" in sys.argv
 
-    # Parse --scan-last N
     scan_last = 0
     for i, arg in enumerate(sys.argv):
         if arg == "--scan-last" and i + 1 < len(sys.argv):
