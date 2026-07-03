@@ -205,7 +205,7 @@ def _process_post(post, name_lookup, acronym_lookup, seen_post_ids, testing, sub
     image_urls = get_image_urls_from_post(post)
 
     if image_urls:
-        print(f"  Image post — {len(image_urls)} image(s). Sending to Gemini...")
+        print(f"  Image post — {len(image_urls)} image(s). Sending to Claude...")
         for idx, img_url in enumerate(image_urls):
             print(f"  Image {idx + 1}/{len(image_urls)}: {img_url}")
             try:
