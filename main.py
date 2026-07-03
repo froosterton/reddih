@@ -2,14 +2,18 @@ import os
 import sys
 import json
 import re
+import base64
 import requests
-from google import genai
-from google.genai import types
+from dotenv import load_dotenv
+from anthropic import Anthropic
+
+load_dotenv()
 
 # ──────────────────────────────────────────────
 # CONFIGURATION (env only — set in .env or host)
 # ──────────────────────────────────────────────
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
 DISCORD_WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
 ROLIMONS_API_URL = os.environ.get("ROLIMONS_API_URL", "https://www.rolimons.com/itemapi/itemdetails")
 MIN_VALUE_THRESHOLD = int(os.environ.get("MIN_VALUE_THRESHOLD", "100000"))
@@ -64,19 +68,45 @@ def normalize_name(name: str) -> str:
 
 
 # ──────────────────────────────────────────────
-# GEMINI VISION — HELPERS
+# CLAUDE VISION — HELPERS
 # ──────────────────────────────────────────────
 
-def _download_image(image_url: str) -> types.Part:
-    """Download an image URL and return a Gemini Part."""
+def _download_image(image_url: str) -> tuple[bytes, str]:
+    """Download an image URL and return (bytes, mime_type)."""
     resp = requests.get(image_url, timeout=30)
     resp.raise_for_status()
     mime_type = resp.headers.get("Content-Type", "image/jpeg").split(";")[0].strip()
-    return types.Part.from_bytes(data=resp.content, mime_type=mime_type)
+    if mime_type not in ("image/jpeg", "image/png", "image/gif", "image/webp"):
+        mime_type = "image/jpeg"
+    return resp.content, mime_type
 
 
-def _get_gemini_client() -> genai.Client:
-    return genai.Client(api_key=GEMINI_API_KEY)
+def _get_claude_client() -> Anthropic:
+    return Anthropic(api_key=ANTHROPIC_API_KEY)
+
+
+def _claude_text(prompt: str, image: tuple[bytes, str] | None = None) -> str:
+    """Send a prompt to Claude, optionally with an image."""
+    client = _get_claude_client()
+    content: list[dict] = []
+    if image:
+        data, mime_type = image
+        content.append({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": mime_type,
+                "data": base64.standard_b64encode(data).decode("ascii"),
+            },
+        })
+    content.append({"type": "text", "text": prompt})
+
+    response = client.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=2048,
+        messages=[{"role": "user", "content": content}],
+    )
+    return response.content[0].text
 
 
 # ──────────────────────────────────────────────
@@ -84,10 +114,8 @@ def _get_gemini_client() -> genai.Client:
 #         a Roblox limited item at all?
 # ──────────────────────────────────────────────
 
-def prescreen_image(image_part: types.Part) -> bool:
-    """Ask Gemini a simple yes/no: does this image reference a Roblox limited item?"""
-    client = _get_gemini_client()
-
+def prescreen_image(image: tuple[bytes, str]) -> bool:
+    """Ask Claude a simple yes/no: does this image reference a Roblox limited item?"""
     prompt = (
         "Look at this image carefully.\n"
         "Is this image referencing a Roblox limited item? "
@@ -102,12 +130,7 @@ def prescreen_image(image_part: types.Part) -> bool:
         "Answer with ONLY the word: yes or no"
     )
 
-    response = client.models.generate_content(
-        model="gemini-2.0-flash",
-        contents=[prompt, image_part],
-    )
-
-    answer = response.text.strip().lower()
+    answer = _claude_text(prompt, image=image).strip().lower()
     return answer.startswith("yes")
 
 
@@ -115,10 +138,8 @@ def prescreen_image(image_part: types.Part) -> bool:
 # STEP 2: EXTRACT — identify every item in the image
 # ──────────────────────────────────────────────
 
-def extract_items_from_image(image_part: types.Part) -> str:
-    """Use Gemini Vision to extract Roblox item details from an image."""
-    client = _get_gemini_client()
-
+def extract_items_from_image(image: tuple[bytes, str]) -> str:
+    """Use Claude Vision to extract Roblox item details from an image."""
     prompt = (
         "This image is from a Reddit post about Roblox limited items.\n"
         "Your job is to identify EVERY Roblox limited item name mentioned or shown "
@@ -149,20 +170,15 @@ def extract_items_from_image(image_part: types.Part) -> str:
         "- If you truly cannot find any Roblox item names, return: []"
     )
 
-    response = client.models.generate_content(
-        model="gemini-2.0-flash",
-        contents=[prompt, image_part],
-    )
-
-    return response.text
+    return _claude_text(prompt, image=image)
 
 
 # ──────────────────────────────────────────────
 # PARSING AND MATCHING
 # ──────────────────────────────────────────────
 
-def parse_gemini_response(raw_text: str) -> list:
-    """Parse the JSON array of item objects from Gemini's response."""
+def parse_claude_response(raw_text: str) -> list:
+    """Parse the JSON array of item objects from Claude's response."""
     text = raw_text.strip()
 
     if text.startswith("```"):
@@ -173,7 +189,7 @@ def parse_gemini_response(raw_text: str) -> list:
     try:
         result = json.loads(text)
     except json.JSONDecodeError:
-        print(f"  Warning: Could not parse Gemini response as JSON.")
+        print(f"  Warning: Could not parse Claude response as JSON.")
         print(f"  Raw response: {raw_text[:500]}")
         return []
 
@@ -203,7 +219,7 @@ def match_single_item(
     Matching order:
       1. Exact normalised name match
       2. Exact acronym match
-      3. Prefix match — if Gemini returned a truncated name (e.g. "Dominus Formidulos..."
+      3. Prefix match — if Claude returned a truncated name (e.g. "Dominus Formidulos..."
          from a cut-off label), match it against the start of Rolimons names.
          Only matches if the prefix is 3+ words to avoid false positives.
 
@@ -398,7 +414,7 @@ def send_discord_text_lead(
 
 
 # ──────────────────────────────────────────────
-# GEMINI TEXT POST SCREENING
+# CLAUDE TEXT POST SCREENING
 # ──────────────────────────────────────────────
 
 def find_mentioned_items(
@@ -529,7 +545,7 @@ def screen_text_post(
     Two-pass approach:
       1. Code-level scan: check title+body for exact Rolimons names/acronyms.
          If a high-value item is found, it's an automatic lead.
-      2. Gemini screening: only for posts that don't mention specific items
+      2. Claude screening: only for posts that don't mention specific items
          but sound like a returning player asking about their account value.
 
     Returns (is_lead, reason, matched_items).
@@ -547,8 +563,7 @@ def screen_text_post(
         names = ", ".join(f"{m['name']} (R$ {m['value']:,})" for m in below)
         return False, f"Item(s) found but below R$ {MIN_VALUE_THRESHOLD:,} threshold: {names}", []
 
-    # ── Pass 2: Gemini screening for generic "returning player" / "sell my account" posts ──
-    client = _get_gemini_client()
+    # ── Pass 2: Claude screening for generic "returning player" / "sell my account" posts ──
     combined_text = f"Title: {title}\n\nBody: {body}" if body else f"Title: {title}"
 
     prompt = (
@@ -581,19 +596,15 @@ def screen_text_post(
     )
 
     try:
-        response = client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=prompt,
-        )
-        text = response.text.strip()
+        text = _claude_text(prompt).strip()
     except Exception as e:
-        print(f"    Gemini text screening error: {e}")
+        print(f"    Claude text screening error: {e}")
         return False, "", []
 
     lines = text.strip().split("\n")
     verdict = False
     reason = ""
-    gemini_items_raw = ""
+    claude_items_raw = ""
 
     for line in lines:
         line_lower = line.strip().lower()
@@ -602,24 +613,24 @@ def screen_text_post(
         elif line_lower.startswith("reason:"):
             reason = line.strip().split(":", 1)[1].strip()
         elif line_lower.startswith("items:"):
-            gemini_items_raw = line.strip().split(":", 1)[1].strip()
+            claude_items_raw = line.strip().split(":", 1)[1].strip()
 
     if not verdict:
         return False, reason, []
 
-    # ── Cross-reference Gemini-identified items against Rolimons ──
-    # If Gemini flagged the post AND identified specific items, check their values.
+    # ── Cross-reference Claude-identified items against Rolimons ──
+    # If Claude flagged the post AND identified specific items, check their values.
     # Filter out the lead if all identified items are at or below the threshold.
-    gemini_item_names = []
-    if gemini_items_raw and gemini_items_raw.lower() != "none":
-        gemini_item_names = [n.strip() for n in gemini_items_raw.split(",") if n.strip()]
+    claude_item_names = []
+    if claude_items_raw and claude_items_raw.lower() != "none":
+        claude_item_names = [n.strip() for n in claude_items_raw.split(",") if n.strip()]
 
-    if gemini_item_names:
-        print(f"    Gemini identified item(s): {', '.join(gemini_item_names)}")
+    if claude_item_names:
+        print(f"    Claude identified item(s): {', '.join(claude_item_names)}")
         matched_above = []
         matched_below = []
 
-        for item_name in gemini_item_names:
+        for item_name in claude_item_names:
             match = match_single_item(item_name, name_lookup, acronym_lookup)
             if match:
                 item_id, item_data = match
@@ -652,7 +663,7 @@ def screen_text_post(
             names = ", ".join(m["name"] for m in matched_above)
             return True, f"{reason} (Confirmed item(s): {names})", matched_above
 
-    # No specific items identified or none matched Rolimons — trust Gemini's verdict
+    # No specific items identified or none matched Rolimons — trust Claude's verdict
     # (e.g. "returning player" posts where no item names are mentioned)
     return verdict, reason, []
 
@@ -703,39 +714,39 @@ def process_image(
     # ── Download image once (reused for both calls) ──
     try:
         print("  Downloading image...")
-        image_part = _download_image(image_url)
+        image = _download_image(image_url)
     except Exception as e:
         print(f"  Error downloading image: {e}")
         return False
 
     # ── Pre-screen: does this image reference a limited? ──
-    print("  Pre-screening with Gemini...")
-    is_relevant = prescreen_image(image_part)
+    print("  Pre-screening with Claude...")
+    is_relevant = prescreen_image(image)
 
     if not is_relevant:
         print("  Result: NOT a limited item image. Skipping.")
         if testing:
-            send_discord_skip_notice(image_url, "Gemini determined this image does not reference a Roblox limited item.")
+            send_discord_skip_notice(image_url, "Claude determined this image does not reference a Roblox limited item.")
         return False
 
     print("  Result: Image likely references a limited item. Extracting details...")
 
     # ── Extract items ──
     try:
-        raw_response = extract_items_from_image(image_part)
+        raw_response = extract_items_from_image(image)
     except Exception as e:
         print(f"  Error extracting items: {e}")
         return False
 
-    print(f"  Gemini output: {raw_response.strip()[:300]}")
+    print(f"  Claude output: {raw_response.strip()[:300]}")
 
     # ── Parse ──
-    detected_items = parse_gemini_response(raw_response)
+    detected_items = parse_claude_response(raw_response)
 
     if not detected_items:
-        print("  No items detected by Gemini.")
+        print("  No items detected by Claude.")
         if testing:
-            send_discord_skip_notice(image_url, "Gemini could not extract any item names from this image.")
+            send_discord_skip_notice(image_url, "Claude could not extract any item names from this image.")
         return False
 
     print(f"  Detected {len(detected_items)} item(s):")
