@@ -1,3 +1,4 @@
-google-genai
+anthropic
+python-dotenv
 requests
 praw
